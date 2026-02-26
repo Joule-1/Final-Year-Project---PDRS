@@ -76,6 +76,7 @@ const UserPreferencesCollector = () => {
                 tdee: String(tdee),
             }
         );
+        console.log(response)
     };
 
     const bmi = useMemo(() => {

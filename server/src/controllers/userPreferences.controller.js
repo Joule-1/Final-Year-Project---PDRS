@@ -2,6 +2,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { UserPreferences } from "../models/userPreferences.model.js";
+// import { runPersonalization } from "../services/personalization.service.js";
 
 const upsertUserPreferences = asyncHandler(async (req, res) => {
     if (!req.body) throw new ApiError(400, "Empty Request");
@@ -46,12 +47,15 @@ const upsertUserPreferences = asyncHandler(async (req, res) => {
         throw new ApiError(500, "Unable to save user preferences");
     }
 
+    // const personalizationResult = await runPersonalization(savedPreferences);
+
     return res
         .status(200)
         .json(
             new ApiResponse(
                 200,
-                savedPreferences,
+                {preferences: savedPreferences},
+                // ...personalizationResult},
                 "User Preferences Saved Successfully"
             )
         );
