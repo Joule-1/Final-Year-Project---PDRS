@@ -1,9 +1,12 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useContext } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Logo } from "../assets";
 import { userLoginAPI } from "../utils/UserLoginAxios.js";
+import { AuthContext } from "../utils/AuthContext.jsx";
+import { userPreferencesAPI } from "../utils/UserPreferencesAxios.js";
 
 function SignUp() {
+    const { user, setUser } = useContext(AuthContext);
     const [showPassword, setShowPassword] = useState(false);
     const [loading, setLoading] = useState(false);
     const [selectedAvatar, setSelectedAvatar] = useState("");
@@ -197,25 +200,22 @@ function SignUp() {
         setLoading(true);
 
         try {
-            console.log("Name:", nameRef.current.value);
-            console.log("Email:", emailRef.current.value);
-            console.log("Password:", passwordRef.current.value);
-            console.log("Avatar:", selectedAvatar);
-
-            const res = await userLoginAPI.post("/register", {
+            
+            const response = await userLoginAPI.post("/register", {
                 name: nameRef.current.value,
                 email: emailRef.current.value,
                 password: passwordRef.current.value,
                 avatarURL: selectedAvatar,
             });
 
-            console.log(res);
-            console.log(res.data.success);
-
-            if (res.data.success) {
-                const res2 = await userLoginAPI.get("/current-user");
-                console.log(res2);
-                navigate("/userPreferencesCollector");
+            if (response.data.success) {
+                const checkUserPreferences = await userPreferencesAPI.get(
+                    "/getCurrentPreferences"
+                );
+                console.log(checkUserPreferences.data.data);
+                console.log(response.data);
+                setUser(response.data);
+                navigate("/dashboard");
             }
         } catch (error) {
             console.error("Registration error:", error);

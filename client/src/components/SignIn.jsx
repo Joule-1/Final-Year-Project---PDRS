@@ -72,7 +72,6 @@ function SignIn() {
             });
 
             if (response.data.success) {
-                console.log("Res", response);
                 const checkUserPreferences = await userPreferencesAPI.get(
                     "/getCurrentPreferences"
                 );
