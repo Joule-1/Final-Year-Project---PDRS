@@ -9,12 +9,31 @@ import os
 import re
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "diet_model.pkl")
+
+# Try multiple model paths (pkl was trained with xgboost - pip install xgboost)
+MODEL_CANDIDATES = [
+    os.path.join(BASE_DIR, "diet_model.pkl"),
+    os.path.join(BASE_DIR, "Older models", "diet_model_personalized.pkl"),
+    os.path.join(BASE_DIR, "Older models", "diet_model_personalized _light.pkl"),
+]
+MODEL_PATH = None
+for p in MODEL_CANDIDATES:
+    if os.path.isfile(p):
+        MODEL_PATH = p
+        break
+if MODEL_PATH is None:
+    raise FileNotFoundError(
+        f"No model file found. Tried: {MODEL_CANDIDATES}. "
+        "Add diet_model.pkl to ml-model-service/ or use a model from Older models/."
+    )
+
 DATA_PATH = os.path.join(BASE_DIR, "raw_data", "final_df_cleaned.csv")
+if not os.path.isfile(DATA_PATH):
+    raise FileNotFoundError(f"Food data CSV not found: {DATA_PATH}")
 
 app = FastAPI(title="DietRecommendationEngine-Pro")
 
-# load model and data once
+# load model and data once (xgboost must be installed for pickle to load)
 model = joblib.load(MODEL_PATH)
 foods_df = pd.read_csv(DATA_PATH)
 

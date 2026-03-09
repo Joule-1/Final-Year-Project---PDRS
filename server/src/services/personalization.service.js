@@ -436,4 +436,64 @@
 //     // rethrow so caller can handle HTTP 500 / 422 appropriately
 //     throw err;
 //   }
-// }; 
+// };
+
+// ----- Active: call ML service for diet recommendations -----
+import axios from "axios";
+
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:8001";
+
+function toNum(v) {
+    if (v === undefined || v === null || v === "") return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * @param {import("../models/userPreferences.model.js").UserPreferences} preferences - Mongoose doc from findOneAndUpdate
+ * @returns {Promise<{ recommendations: any[]; mealPlan: any; mealTotals: any; totals: any; healthProfile: any }>}
+ */
+export async function callMLRecommendations(preferences) {
+    const prefs = preferences.toObject ? preferences.toObject() : preferences;
+    const conditions = Array.isArray(prefs.conditions) ? prefs.conditions : [];
+    const age = toNum(prefs.age);
+    const height = toNum(prefs.height);
+    const weight = toNum(prefs.weight);
+    const bmr = toNum(prefs.bmr);
+    const tdee = toNum(prefs.tdee);
+    const bmi = toNum(prefs.bmi);
+    const calorieTarget = toNum(prefs.calorieTarget) || tdee;
+    const proteinTarget = toNum(prefs.proteinTarget);
+
+    const body = {
+        userPreferences: {
+            conditions: conditions.map((c) => String(c).toLowerCase().trim()),
+            dietPreference: prefs.dietPreference || null,
+            activityLevel: prefs.activityLevel || null,
+            age: age ?? undefined,
+            gender: prefs.gender || null,
+            height: height ?? undefined,
+            weight: weight ?? undefined,
+            bodyFatPercentage: toNum(prefs.bodyFatPercentage),
+            calorieTarget: calorieTarget ?? undefined,
+            proteinTarget: proteinTarget ?? undefined,
+            bmi: bmi ?? undefined,
+            bmr: bmr ?? undefined,
+            tdee: tdee ?? undefined,
+        },
+        top_k: 50,
+    };
+
+    const { data } = await axios.post(`${ML_SERVICE_URL}/predict/foods`, body, {
+        timeout: 60000,
+        headers: { "Content-Type": "application/json" },
+    });
+
+    return {
+        recommendations: data.recommendations || [],
+        mealPlan: data.mealPlan || {},
+        mealTotals: data.mealTotals || {},
+        totals: data.totals || {},
+        healthProfile: data.healthProfile || {},
+    };
+} 

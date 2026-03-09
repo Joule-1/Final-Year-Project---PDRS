@@ -1,5 +1,16 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import Select from "react-select";
+import {
+    UtensilsCrossed,
+    Flame,
+    Target,
+    Scale,
+    Sun,
+    Coffee,
+    Apple,
+    Moon,
+    ChevronRight,
+} from "lucide-react";
 import { dietTypeOptions } from "../utils/options/dietType_options";
 import { activityLevelOptions } from "../utils/options/activityLevel_options";
 import { healthConditionOptions } from "../utils/options/healthCondition_options";
@@ -7,6 +18,18 @@ import { genderOptions } from "../utils/options/gender_options";
 import { userPreferencesAPI } from "../utils/UserPreferencesAxios";
 import { AuthContext } from "../utils/AuthContext";
 import VerifyUserLogIn from "../utils/VerifyUserLogIn";
+
+const mealTypeConfig = {
+    breakfast: { icon: Sun, label: "Breakfast", color: "bg-amber-100 text-amber-800 border-amber-200" },
+    snack: { icon: Apple, label: "Snack", color: "bg-lime-100 text-lime-800 border-lime-200" },
+    beverage: { icon: Coffee, label: "Beverage", color: "bg-sky-100 text-sky-800 border-sky-200" },
+    lunch: { icon: UtensilsCrossed, label: "Lunch", color: "bg-emerald-100 text-emerald-800 border-emerald-200" },
+    dinner: { icon: Moon, label: "Dinner", color: "bg-violet-100 text-violet-800 border-violet-200" },
+};
+function getMealBadge(mealType) {
+    const key = (mealType || "").toLowerCase();
+    return mealTypeConfig[key] || { icon: UtensilsCrossed, label: key || "Meal", color: "bg-gray-100 text-gray-700 border-gray-200" };
+}
 
 const UserPreferencesCollector = () => {
     const [dietPreference, setDietPreference] = useState(false);
@@ -19,6 +42,9 @@ const UserPreferencesCollector = () => {
     const [bodyFatPercentage, setBodyFatPercentage] = useState("");
     const [calorieTarget, setCalorieTarget] = useState("");
     const [proteinTarget, setProteinTarget] = useState("");
+    const [recommendationResult, setRecommendationResult] = useState(null);
+    const [submitError, setSubmitError] = useState(null);
+    const [isSubmitting, setIsSubmitting] = useState(false);
     const [bmiInfoDisplay, setBMIInfoDisplay] = useState(false);
     const [bmrInfoDisplay, setBMRInfoDisplay] = useState(false);
     const [tdeeInfoDisplay, setTDEEInfoDisplay] = useState(false);
@@ -58,25 +84,50 @@ const UserPreferencesCollector = () => {
 
     const handleSubmit = async (event) => {
         event.preventDefault();
-        const response = await userPreferencesAPI.put(
-            "/registerUserPreferences",
-            {
+        setSubmitError(null);
+        setRecommendationResult(null);
+        setIsSubmitting(true);
+        try {
+            const payload = {
                 conditions: conditions,
-                dietPreference: dietPreference,
-                activityLevel: activityLevel,
+                dietPreference: dietPreference?.value ?? dietPreference,
+                activityLevel: activityLevel?.value ?? activityLevel,
                 age: age,
-                gender: gender,
+                gender: gender?.value ?? gender,
                 height: height,
                 weight: weight,
                 bodyFatPercentage: bodyFatPercentage,
                 calorieTarget: calorieTarget,
                 proteinTarget: proteinTarget,
-                bmi: String(bmi),
-                bmr: String(bmr),
-                tdee: String(tdee),
+                bmi: bmi != null && bmi !== "" ? String(bmi) : undefined,
+                bmr: bmr != null && bmr !== "" ? String(bmr) : undefined,
+                tdee: tdee != null && tdee !== "" ? String(tdee) : undefined,
+            };
+            const response = await userPreferencesAPI.put(
+                "/registerUserPreferences",
+                payload
+            );
+            const data = response?.data?.data;
+            if (data?.recommendations) {
+                setRecommendationResult({
+                    recommendations: data.recommendations,
+                    mealPlan: data.mealPlan || {},
+                    mealTotals: data.mealTotals || {},
+                    totals: data.totals || {},
+                    healthProfile: data.healthProfile || {},
+                });
+            } else if (data?.preferences) {
+                setSubmitError(
+                    "Preferences saved, but diet recommendations could not be loaded. Ensure the ML service is running on port 8001."
+                );
             }
-        );
-        console.log(response)
+        } catch (err) {
+            setSubmitError(
+                err?.response?.data?.message || err?.message || "Failed to submit"
+            );
+        } finally {
+            setIsSubmitting(false);
+        }
     };
 
     const bmi = useMemo(() => {
@@ -165,7 +216,8 @@ const UserPreferencesCollector = () => {
         }
     };
     const handleBMRColor = (bmrValue) => {
-        if (gender.value == "male") {
+        const g = gender?.value ?? gender;
+        if (g === "male") {
             if (bmrValue < 1400) {
                 return "text-gray-400";
             } else if (bmrValue >= 1400 && bmrValue <= 1900) {
@@ -539,18 +591,18 @@ const UserPreferencesCollector = () => {
                     <div className="flex w-full flex-wrap place-content-evenly">
                         <Select
                             placeholder="Diet Preferences*"
-                            value={dietPreference.value}
+                            value={dietTypeOptions.find((o) => o.value === dietPreference) ?? null}
                             onChange={(selected) =>
-                                setDietPreference(selected.value)
+                                setDietPreference(selected?.value ?? selected)
                             }
                             className="my-5 w-[250px]"
                             options={dietTypeOptions}
                         />
                         <Select
                             placeholder="Activity Level*"
-                            value={activityLevel.value}
+                            value={activityLevelOptions.find((o) => o.value === activityLevel) ?? null}
                             onChange={(selected) =>
-                                setActivityLevel(selected.value)
+                                setActivityLevel(selected?.value ?? selected)
                             }
                             className="my-5 w-[250px]"
                             options={activityLevelOptions}
@@ -577,18 +629,25 @@ const UserPreferencesCollector = () => {
                         />
                         <Select
                             placeholder="Gender*"
-                            value={gender.value}
-                            onChange={(selected) => setGender(selected.value)}
+                            value={genderOptions.find((o) => o.value === gender) ?? null}
+                            onChange={(selected) => setGender(selected?.value ?? selected)}
                             className="my-5 w-[250px]"
                             options={genderOptions}
                         />
                     </div>
                     <button
+                        type="button"
                         onClick={handleSubmit}
-                        className="poppins-semibold hover:border-bg-green-700 my-5 cursor-pointer rounded-xl border-4 bg-green-700 px-4 py-2 text-white hover:bg-white hover:text-green-700"
+                        disabled={isSubmitting}
+                        className="poppins-semibold hover:border-bg-green-700 my-5 cursor-pointer rounded-xl border-4 bg-green-700 px-4 py-2 text-white hover:bg-white hover:text-green-700 disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                        Submit
+                        {isSubmitting ? "Submitting…" : "Submit"}
                     </button>
+                    {submitError && (
+                        <p className="my-2 max-w-md text-sm text-red-600">
+                            {submitError}
+                        </p>
+                    )}
                 </div>
                 <div className="flex-3">
                     <div className="flex w-full flex-wrap place-content-evenly">
@@ -656,6 +715,152 @@ const UserPreferencesCollector = () => {
                     </div>
                 </div>
             </div>
+
+            {recommendationResult && (
+                <div className="mt-10 overflow-hidden rounded-2xl bg-gradient-to-b from-slate-50 to-white shadow-lg ring-1 ring-slate-200/60">
+                    {/* Header */}
+                    <div className="border-b border-slate-200/80 bg-gradient-to-r from-emerald-600 to-teal-600 px-6 py-6 text-white">
+                        <div className="flex items-center gap-3">
+                            <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-white/20 backdrop-blur-sm">
+                                <UtensilsCrossed className="h-6 w-6" />
+                            </div>
+                            <div>
+                                <h2 className="poppins-semibold text-2xl tracking-tight">
+                                    Your Diet Recommendations
+                                </h2>
+                                <p className="mt-0.5 text-sm text-emerald-100">
+                                    Personalized for your profile and goals
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Stats strip */}
+                    {recommendationResult.healthProfile && (
+                        <div className="grid grid-cols-2 gap-3 border-b border-slate-100 bg-white/50 p-4 sm:grid-cols-4">
+                            <div className="flex items-center gap-3 rounded-xl bg-white px-4 py-3 shadow-sm ring-1 ring-slate-100">
+                                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-100 text-slate-600">
+                                    <Scale className="h-5 w-5" />
+                                </div>
+                                <div>
+                                    <p className="text-xs font-medium uppercase tracking-wider text-slate-500">BMI</p>
+                                    <p className="poppins-semibold text-slate-800">{recommendationResult.healthProfile.bmi}</p>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-3 rounded-xl bg-white px-4 py-3 shadow-sm ring-1 ring-slate-100">
+                                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-orange-100 text-orange-600">
+                                    <Flame className="h-5 w-5" />
+                                </div>
+                                <div>
+                                    <p className="text-xs font-medium uppercase tracking-wider text-slate-500">TDEE</p>
+                                    <p className="poppins-semibold text-slate-800">{recommendationResult.healthProfile.tdee} kcal</p>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-3 rounded-xl bg-white px-4 py-3 shadow-sm ring-1 ring-slate-100">
+                                <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-100 text-emerald-600">
+                                    <Target className="h-5 w-5" />
+                                </div>
+                                <div>
+                                    <p className="text-xs font-medium uppercase tracking-wider text-slate-500">Calorie target</p>
+                                    <p className="poppins-semibold text-slate-800">
+                                        {recommendationResult.healthProfile.calorieTarget ?? recommendationResult.healthProfile.tdee} kcal
+                                    </p>
+                                </div>
+                            </div>
+                            {recommendationResult.healthProfile.proteinTarget != null && (
+                                <div className="flex items-center gap-3 rounded-xl bg-white px-4 py-3 shadow-sm ring-1 ring-slate-100">
+                                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-amber-100 text-amber-600">
+                                        <UtensilsCrossed className="h-5 w-5" />
+                                    </div>
+                                    <div>
+                                        <p className="text-xs font-medium uppercase tracking-wider text-slate-500">Protein target</p>
+                                        <p className="poppins-semibold text-slate-800">{recommendationResult.healthProfile.proteinTarget}g</p>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* Recommendations grid */}
+                    <div className="p-6">
+                        <h3 className="poppins-semibold mb-4 text-slate-800">Recommended dishes</h3>
+                        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                            {recommendationResult.recommendations?.slice(0, 24).map((item, i) => {
+                                const badge = getMealBadge(item.meal_type);
+                                const MealIcon = badge.icon;
+                                return (
+                                    <div
+                                        key={i}
+                                        className="group relative rounded-xl border border-slate-200/80 bg-white p-4 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md hover:ring-2 hover:ring-emerald-200"
+                                    >
+                                        <div className="flex items-start justify-between gap-2">
+                                            <p className="poppins-medium flex-1 text-slate-800 line-clamp-2">
+                                                {item["Dish Name"] || item.dishName || "—"}
+                                            </p>
+                                            <span className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-xs font-medium ${badge.color}`}>
+                                                <MealIcon className="h-3.5 w-3.5" />
+                                                {badge.label}
+                                            </span>
+                                        </div>
+                                        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-500">
+                                            {item["Calories (kcal)"] != null && (
+                                                <span className="inline-flex items-center gap-1">
+                                                    <Flame className="h-4 w-4 text-orange-400" />
+                                                    {Math.round(item["Calories (kcal)"])} kcal
+                                                </span>
+                                            )}
+                                            {item["Protein (g)"] != null && (
+                                                <span>{Math.round(item["Protein (g)"])}g protein</span>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+
+                    {/* Meal plan */}
+                    {recommendationResult.mealPlan && Object.keys(recommendationResult.mealPlan).length > 0 && (
+                        <div className="border-t border-slate-200/80 bg-slate-50/50 p-6">
+                            <h3 className="poppins-semibold mb-4 flex items-center gap-2 text-slate-800">
+                                <UtensilsCrossed className="h-5 w-5 text-emerald-600" />
+                                Your meal plan
+                            </h3>
+                            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+                                {Object.entries(recommendationResult.mealPlan).map(([meal, items]) => {
+                                    const config = mealTypeConfig[meal] || { icon: UtensilsCrossed, label: meal, color: "bg-slate-100 text-slate-700 border-slate-200" };
+                                    const Icon = config.icon;
+                                    const totals = recommendationResult.mealTotals?.[meal];
+                                    return (
+                                        <div
+                                            key={meal}
+                                            className="rounded-xl border border-slate-200/80 bg-white p-4 shadow-sm transition-shadow hover:shadow-md"
+                                        >
+                                            <div className={`mb-3 inline-flex items-center gap-2 rounded-lg border px-3 py-2 ${config.color}`}>
+                                                <Icon className="h-4 w-4" />
+                                                <span className="poppins-medium text-sm capitalize">{config.label}</span>
+                                            </div>
+                                            <ul className="space-y-2">
+                                                {(items || []).slice(0, 5).map((food, j) => (
+                                                    <li key={j} className="flex items-start gap-2 text-sm text-slate-600">
+                                                        <ChevronRight className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
+                                                        <span className="line-clamp-2">{food["Dish Name"] || food.dishName || "—"}</span>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                            {totals && (
+                                                <div className="mt-3 border-t border-slate-100 pt-3 text-xs font-medium text-slate-500">
+                                                    {Math.round(totals.calories)} kcal · {Math.round(totals.protein)}g protein
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
         </section>
     );
 };

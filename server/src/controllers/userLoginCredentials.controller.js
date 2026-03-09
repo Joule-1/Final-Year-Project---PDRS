@@ -2,6 +2,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { UserLogin } from "../models/userLoginCredentials.model.js";
+import validator from "validator";
 import jwt from "jsonwebtoken";
 
 const generateAccessAndRefreshTokens = async (userId) => {
@@ -26,15 +27,18 @@ const generateAccessAndRefreshTokens = async (userId) => {
 };
 
 const registerUser = asyncHandler(async (req, res) => {
-    const { name, email, password, avatarURL } = req.body;
+    let { name, email, password, avatarURL } = req.body;
+    name = name?.trim();
+    email = email?.trim();
+    password = password?.trim();
+    avatarURL = avatarURL?.trim();
 
-    if (
-        [name, email, password, avatarURL].some((field) => field?.trim() === "")
-    ) {
+    if ([name, email, password, avatarURL].some((field) => !field)) {
         throw new ApiError(400, "All fields are required");
     }
 
-    const existedUser = await UserLogin.findOne({ email: email });
+    const normalizedEmail = validator.normalizeEmail(email, { gmail_lowercase: true }) || email.toLowerCase();
+    const existedUser = await UserLogin.findOne({ email: normalizedEmail });
 
     if (existedUser)
         throw new ApiError(
@@ -44,7 +48,7 @@ const registerUser = asyncHandler(async (req, res) => {
 
     const user = await UserLogin.create({
         name,
-        email,
+        email: normalizedEmail,
         password,
         avatarURL,
     });
@@ -84,14 +88,21 @@ const registerUser = asyncHandler(async (req, res) => {
 });
 
 const loginUser = asyncHandler(async (req, res) => {
-    const { email, username, password } = req.body;
+    let { email, username, password } = req.body;
+    email = email?.trim();
+    username = username?.trim();
+    password = password?.trim();
 
     if (!username && !email)
         throw new ApiError(400, "Username or Email is required");
 
-    const user = await UserLogin.findOne({
-        $or: [{ username }, { email }],
-    });
+    const normalizedEmail = email ? (validator.normalizeEmail(email, { gmail_lowercase: true }) || email.toLowerCase()) : undefined;
+    const query = [];
+    if (username) query.push({ username });
+    if (normalizedEmail !== undefined) query.push({ email: normalizedEmail });
+    if (query.length === 0) throw new ApiError(400, "Username or Email is required");
+
+    const user = await UserLogin.findOne({ $or: query });
 
     if (!user) throw new ApiError(400, "UserLogin doesn't exist");
 
