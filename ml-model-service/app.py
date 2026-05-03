@@ -7,25 +7,45 @@ import numpy as np
 import joblib
 import os
 import re
+import gc
+import time
+import warnings
+
+from xgboost import XGBClassifier
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Try multiple model paths (pkl was trained with xgboost - pip install xgboost)
-MODEL_CANDIDATES = [
+# Prefer native JSON (stable across XGBoost versions); pickle is fallback only.
+NATIVE_MODEL_CANDIDATES = [
+    os.path.join(BASE_DIR, "diet_model_native.json"),
+    os.path.join(BASE_DIR, "diet_model.json"),
+]
+PICKLE_MODEL_CANDIDATES = [
     os.path.join(BASE_DIR, "diet_model.pkl"),
     os.path.join(BASE_DIR, "Older models", "diet_model_personalized.pkl"),
     os.path.join(BASE_DIR, "Older models", "diet_model_personalized _light.pkl"),
 ]
-MODEL_PATH = None
-for p in MODEL_CANDIDATES:
-    if os.path.isfile(p):
-        MODEL_PATH = p
-        break
-if MODEL_PATH is None:
-    raise FileNotFoundError(
-        f"No model file found. Tried: {MODEL_CANDIDATES}. "
-        "Add diet_model.pkl to ml-model-service/ or use a model from Older models/."
-    )
+
+
+def load_classifier():
+    for path in NATIVE_MODEL_CANDIDATES:
+        if os.path.isfile(path):
+            clf = XGBClassifier()
+            clf.load_model(path)
+            print(f"[INIT] Loaded native XGBoost model ({os.path.basename(path)})")
+            return clf
+    pickle_path = next((p for p in PICKLE_MODEL_CANDIDATES if os.path.isfile(p)), None)
+    if pickle_path is None:
+        raise FileNotFoundError(
+            "No model found. Add diet_model_native.json or run export_native_model.py; "
+            f"otherwise provide one of: {PICKLE_MODEL_CANDIDATES}"
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        clf = joblib.load(pickle_path)
+    print(f"[INIT] Loaded pickled model ({os.path.basename(pickle_path)}) — consider export_native_model.py")
+    return clf
+
 
 DATA_PATH = os.path.join(BASE_DIR, "raw_data", "final_df_cleaned.csv")
 if not os.path.isfile(DATA_PATH):
@@ -33,11 +53,52 @@ if not os.path.isfile(DATA_PATH):
 
 app = FastAPI(title="DietRecommendationEngine-Pro")
 
-# load model and data once (xgboost must be installed for pickle to load)
-model = joblib.load(MODEL_PATH)
-foods_df = pd.read_csv(DATA_PATH)
+print("[INIT] Loading model...")
+model = load_classifier()
+print("[INIT] Loading CSV...")
+_raw = pd.read_csv(DATA_PATH)
 
-# ===== Request models =====
+NUTRIENT_COLS = [
+    "Calories (kcal)", "Carbohydrates (g)", "Protein (g)", "Fats (g)",
+    "Free Sugar (g)", "Fibre (g)", "Sodium (mg)", "Calcium (mg)",
+    "Iron (mg)", "Vitamin C (mg)", "Folate (µg)",
+]
+
+# Unique food table
+_food_cols = ["Dish Name"] + NUTRIENT_COLS + ["meal_type", "food_group", "diet_preference"]
+FOODS = _raw[_food_cols].drop_duplicates(subset=["Dish Name"]).reset_index(drop=True).copy()
+N_FOODS = len(FOODS)
+print(f"[INIT] {N_FOODS} unique dishes")
+
+# Label encoder maps (sorted = sklearn LabelEncoder default)
+COND_CLASSES = sorted(_raw["condition"].unique())
+MT_CLASSES = sorted(_raw["meal_type"].unique())
+FG_CLASSES = sorted(_raw["food_group"].unique())
+DP_CLASSES = sorted(_raw["diet_preference"].unique())
+
+COND_MAP = {v: i for i, v in enumerate(COND_CLASSES)}
+MT_MAP = {v: i for i, v in enumerate(MT_CLASSES)}
+FG_MAP = {v: i for i, v in enumerate(FG_CLASSES)}
+DP_MAP = {v: i for i, v in enumerate(DP_CLASSES)}
+
+# Pre-encode once (immutable arrays)
+NUTR_MAT = FOODS[NUTRIENT_COLS].fillna(0).to_numpy(dtype=np.float32).copy()
+MT_ENC = FOODS["meal_type"].map(MT_MAP).fillna(0).to_numpy(dtype=np.float32).copy()
+FG_ENC = FOODS["food_group"].map(FG_MAP).fillna(0).to_numpy(dtype=np.float32).copy()
+DP_ENC = FOODS["diet_preference"].map(DP_MAP).fillna(0).to_numpy(dtype=np.float32).copy()
+DISH_NAMES = FOODS["Dish Name"].to_numpy().copy()
+CALORIES = FOODS["Calories (kcal)"].fillna(0).to_numpy(dtype=np.float32).copy()
+PROTEIN = FOODS["Protein (g)"].fillna(0).to_numpy(dtype=np.float32).copy()
+MEAL_TYPES = FOODS["meal_type"].fillna("").to_numpy().copy()
+FOOD_GROUPS = FOODS["food_group"].fillna("").to_numpy().copy()
+DIET_PREFS = FOODS["diet_preference"].fillna("").to_numpy().copy()
+
+del _raw
+gc.collect()
+print("[INIT] Ready")
+
+
+# ---- Request models ----
 class UserPreferences(BaseModel):
     conditions: List[str]
     dietPreference: Optional[str] = None
@@ -57,294 +118,237 @@ class PredictRequest(BaseModel):
     userPreferences: UserPreferences
     top_k: int = 50
 
-# ===== Multi-condition encoding WITHOUT increasing feature count =====
-# We compress multiple conditions into a single integer using bitmask.
-ALL_CONDITIONS = [
-    "obesity", "diabetes", "hypertension", "pcos", "ibs", "anemia"
-]
-# (Ensure this list covers conditions used in UI; adding new conditions still uses one scalar.)
 
-def condition_bitmask(conditions: List[str]) -> float:
-    mask = 0
-    for cond in conditions:
-        cond_l = str(cond).lower().strip()
-        if cond_l in ALL_CONDITIONS:
-            i = ALL_CONDITIONS.index(cond_l)
-            mask |= (1 << i)
-    return float(mask)
+# ---- Helpers ----
+DIET_HIERARCHY = {"veg": {"veg"}, "egg": {"veg", "egg"}, "non_veg": {"veg", "egg", "non_veg"}}
+COND_NAME_MAP = {c.lower(): c for c in COND_CLASSES}
+COND_NAME_MAP.update({c.lower().replace("_", ""): c for c in COND_CLASSES})
 
-# diet encoding (keep single scalar)
-DIET_MAP = {"veg": 0.0, "egg": 1.0, "non_veg": 2.0}
-
-# nutrient columns used in training (order is important — must match model training)
-NUTRIENT_COLS = [
-    "Calories (kcal)",
-    "Carbohydrates (g)",
-    "Protein (g)",
-    "Fats (g)",
-    "Free Sugar (g)",
-    "Fibre (g)",
-    "Sodium (mg)",
-    "Calcium (mg)",
-    "Iron (mg)",
-    "Vitamin C (mg)",
-    "Folate (µg)"
-]
-# total features = 11 nutrient_cols + 1 condition + 1 diet + 1 bmi + 1 tdee = 15
-
-# ===== Clinical filters =====
-def apply_clinical_filters(df: pd.DataFrame, conditions: List[str]) -> pd.DataFrame:
-    dd = df.copy()
-    conds = [c.lower() for c in conditions]
-
-    # Remove obvious non-meal items (strong blacklist)
-    blacklist = ["masala", "powder", "blend", "pickle"]  # add more if needed
-    pattern = "|".join(re.escape(x) for x in blacklist)
-    dd = dd[~dd["Dish Name"].str.lower().str.contains(pattern, na=False)]
-
-    # Hypertension: strict sodium cap
-    if "hypertension" in conds:
-        dd = dd[dd["Sodium (mg)"].fillna(0) <= 500]
-
-    # Diabetes / PCOS: strict free sugar cap
-    if "diabetes" in conds:
-        dd = dd[dd["Free Sugar (g)"].fillna(0) <= 10]
-    if "pcos" in conds:
-        dd = dd[dd["Free Sugar (g)"].fillna(0) <= 12]
-
-    # Obesity: hard calorie filter
-    if "obesity" in conds:
-        dd = dd[dd["Calories (kcal)"].fillna(0) <= 450]
-
-    return dd
-
-# ===== Auto category clustering (diversity) =====
-PRIORITY_KEYWORDS = [
+PRIORITY_KW = [
     "sandwich", "omelette", "omlet", "paratha", "parantha",
-    "dosa", "idli", "cake", "pulao", "soup", "salad", "roti", "curry", "dal"
+    "dosa", "idli", "cake", "pulao", "soup", "salad", "roti", "curry", "dal",
+    "rice", "bhaji", "sabzi", "halwa", "kheer", "chutney", "raita",
 ]
 
 def auto_category(name: str) -> str:
-    if not isinstance(name, str):
-        return ""
-    s = name.lower()
-    for k in PRIORITY_KEYWORDS:
+    s = str(name).lower()
+    for k in PRIORITY_KW:
         if k in s:
             return k
-    tokens = re.findall(r"\b[a-z]+\b", s)
+    tokens = re.findall(r"\b[a-z]{3,}\b", s)
     return tokens[0] if tokens else s
 
-# ===== Fast greedy optimizer (protein-aware value density) =====
-def greedy_select(df: pd.DataFrame, calorie_limit: float, protein_goal: float, max_items: int = 3):
-    if df.empty:
-        return [], 0.0, 0.0
+def normalize_condition(cond: str) -> Optional[str]:
+    c = cond.strip()
+    if c in COND_CLASSES:
+        return c
+    return COND_NAME_MAP.get(c.lower()) or COND_NAME_MAP.get(c.lower().replace(" ", "_"))
 
-    # compute value = score-weighted + protein contribution
-    df2 = df.copy()
-    df2["score_norm"] = (df2["score"] - df2["score"].min()) / (df2["score"].max() - df2["score"].min() + 1e-8)
-    df2["value"] = df2["score_norm"] * 100 + (df2["Protein (g)"].fillna(0) / max(1.0, protein_goal)) * 20
+def get_candidate_mask(diet_pref: str, conditions_raw: List[str]) -> np.ndarray:
+    allowed_diets = DIET_HIERARCHY.get(diet_pref, {"veg", "egg", "non_veg"})
+    mask = np.array([d in allowed_diets for d in DIET_PREFS])
 
-    df2["density"] = df2["value"] / df2["Calories (kcal)"].replace(0, 1)
+    conds = {c.lower() for c in conditions_raw}
+    names_lower = np.char.lower(DISH_NAMES.astype(str))
+    blacklist_pat = re.compile(r"masala|powder|blend|pickle")
+    mask &= np.array([not blacklist_pat.search(n) for n in names_lower])
 
-    df2 = df2.sort_values("density", ascending=False)
+    if "hypertension" in conds:
+        mask &= FOODS["Sodium (mg)"].fillna(0).to_numpy() <= 500
+    if "diabetes" in conds:
+        mask &= FOODS["Free Sugar (g)"].fillna(0).to_numpy() <= 10
+    if "pcos" in conds:
+        mask &= FOODS["Free Sugar (g)"].fillna(0).to_numpy() <= 12
+    if "obesity" in conds:
+        mask &= CALORIES <= 450
+    if "hyperlipidemia" in conds:
+        mask &= FOODS["Fats (g)"].fillna(0).to_numpy() <= 15
+    if "gout" in conds:
+        mask &= PROTEIN <= 25
+    if "ckd_early" in conds:
+        mask &= FOODS["Sodium (mg)"].fillna(0).to_numpy() <= 400
+        mask &= PROTEIN <= 20
 
-    selected = []
-    cal_sum = 0.0
-    prot_sum = 0.0
-    cal_cap = calorie_limit * 1.05  # small slack
+    return mask
 
-    for _, row in df2.iterrows():
-        if len(selected) >= max_items:
-            break
-        cal = float(row["Calories (kcal)"] or 0)
-        prot = float(row["Protein (g)"] or 0)
-        if cal <= 0:
-            continue
-        if cal_sum + cal <= cal_cap or len(selected) == 0:
-            selected.append(row)
-            cal_sum += cal
-            prot_sum += prot
+def build_X(mask: np.ndarray, cond_code: float) -> np.ndarray:
+    n = mask.sum()
+    return np.column_stack([
+        NUTR_MAT[mask],
+        np.full(n, cond_code, dtype=np.float32),
+        MT_ENC[mask],
+        FG_ENC[mask],
+        DP_ENC[mask],
+    ])
 
-    # as fallback try lowest-calorie top-scoring candidates (if nothing selected)
-    if len(selected) == 0 and not df2.empty:
-        top = df2.sort_values(["score", "Calories (kcal)"], ascending=[False, True]).head(max_items)
-        for _, r in top.iterrows():
-            selected.append(r)
-            cal_sum += float(r["Calories (kcal)"] or 0)
-            prot_sum += float(r["Protein (g)"] or 0)
 
-    # convert to list of dicts
-    items = []
-    for r in selected:
-        items.append({
-            "Dish Name": r["Dish Name"],
-            "score": float(r["score"]),
-            "Calories (kcal)": float(r["Calories (kcal)"] or 0),
-            "Protein (g)": float(r["Protein (g)"] or 0),
-            "meal_type": r.get("meal_type", "")
-        })
-    return items, round(cal_sum, 2), round(prot_sum, 2)
-
-# ===== Main endpoint =====
 @app.post("/predict/foods")
 def predict_foods(req: PredictRequest):
+    t0 = time.time()
     try:
         prefs = req.userPreferences
-
-        # compute safe numeric defaults
         age = float(prefs.age or 30)
         height = float(prefs.height or 170)
         weight = float(prefs.weight or 70)
-        bmi = float(prefs.bmi) if prefs.bmi else round(weight / ((height/100)**2), 2)
-        tdee = float(prefs.tdee) if prefs.tdee else round( (10*weight + 6.25*height - 5*age + (5 if prefs.gender=="male" else -161)) * (1.2), 0)
-
-        # clinical filters first (reduce candidate set)
-        df_filtered = apply_clinical_filters(foods_df, prefs.conditions or [])
-
-        # Prepare features: keep EXACTLY 15 features in the exact order used in training
-        X_rows = []
-        processed_rows = []
-        # Prefill nutrient values with zeros for missing columns
-        for _, row in df_filtered.iterrows():
-            # If column missing in csv, fill 0
-            nutrient_vals = []
-            for col in NUTRIENT_COLS:
-                nutrient_vals.append(float(row.get(col, 0) or 0))
-            cond_code = condition_bitmask(prefs.conditions or [])
-            diet_code = float(DIET_MAP.get((prefs.dietPreference or "").lower(), 0.0))
-            # Order MUST match model training:
-            # [nutrient_cols...] + [condition_encoded] + [diet_encoded] + [bmi] + [tdee]
-            feature_vec = nutrient_vals + [cond_code, diet_code, float(bmi), float(tdee)]
-            X_rows.append(feature_vec)
-            processed_rows.append(row)
-
-        if len(X_rows) == 0:
-            # no candidates after clinical filters
-            return {
-                "success": True,
-                "healthProfile": {"bmi": bmi, "tdee": tdee},
-                "recommendations": [],
-                "rawRecommendations": [],
-                "mealPlan": {},
-                "mealTotals": {}
-            }
-
-        X = np.array(X_rows, dtype=float)
-
-        # protective check: enforce shape to match model
-        if X.shape[1] != 15:
-            raise HTTPException(status_code=500, detail=f"Feature shape mismatch: expected 15 got {X.shape[1]}")
-
-        probs = model.predict_proba(X)[:, 1]
-        # build results dataframe
-        out = []
-        for r, p, row in zip(processed_rows, probs, processed_rows):
-            out.append({
-                "Dish Name": row["Dish Name"],
-                "score": float(p),
-                "Calories (kcal)": float(row.get("Calories (kcal)", 0) or 0),
-                "Protein (g)": float(row.get("Protein (g)", 0) or 0),
-                "meal_type": (row.get("meal_type") or row.get("mealType") or "").lower()
-            })
-        raw_df = pd.DataFrame(out)
-
-        # 🔥 HARD DEDUPLICATION (by Dish Name + Calories)
-        raw_df = raw_df.drop_duplicates(
-            subset=["Dish Name", "Calories (kcal)", "Protein (g)"]
-        ).reset_index(drop=True)
-
-        # small adjustments: penalize extreme sugar for diabetes or obesity to lower their score
-        if any(c.lower() == "diabetes" for c in (prefs.conditions or [])):
-            raw_df["score"] -= (raw_df["Protein (g)"].fillna(0) * 0.001)  # favor protein slight
-            raw_df["score"] -= (raw_df["Calories (kcal)"] / 1000) * 0.05
-            raw_df["score"] -= (raw_df["Calories (kcal)"] / 1000) * (raw_df["Protein (g)"] < 3).astype(float) * 0.03
-
-        raw_df["score"] = raw_df["score"].clip(lower=0.0)
-
-        # Sort by score
-        raw_df = raw_df.sort_values("score", ascending=False).reset_index(drop=True)
-
-        # Auto category clustering and diversity reduction
-        raw_df["_category"] = raw_df["Dish Name"].apply(auto_category)
-        dedup_df = raw_df.drop_duplicates(subset=["_category"]).reset_index(drop=True)
-
-        # ===== SMART RECOMMENDATION FILTERING =====
-
-        # 1️⃣ Remove ultra-low calorie noise (waters, stocks, etc.)
-        filtered = raw_df[raw_df["Calories (kcal)"] >= 40].copy()
-
-        # 2️⃣ Remove very low confidence predictions
-        filtered = filtered[filtered["score"] >= 0.60]
-
-        # 3️⃣ Auto category clustering (limit duplicates per food type)
-        filtered["_category"] = filtered["Dish Name"].apply(auto_category)
-
-        MAX_PER_CATEGORY = 2
-        filtered = (
-            filtered.sort_values("score", ascending=False)
-            .groupby("_category", as_index=False)
-            .head(MAX_PER_CATEGORY)
+        bmi = float(prefs.bmi) if prefs.bmi else round(weight / ((height / 100) ** 2), 2)
+        tdee = float(prefs.tdee) if prefs.tdee else round(
+            (10 * weight + 6.25 * height - 5 * age + (5 if prefs.gender == "male" else -161)) * 1.2
         )
+        cal_target = float(prefs.calorieTarget) if prefs.calorieTarget else float(tdee)
+        prot_target = float(prefs.proteinTarget) if prefs.proteinTarget else float(max(50.0, round(weight * 1.4)))
 
-        # 4️⃣ Limit per meal type
-        MAX_PER_MEAL = 6
-        filtered = (
-            filtered.sort_values("score", ascending=False)
-            .groupby("meal_type", as_index=False)
-            .head(MAX_PER_MEAL)
+        diet_pref = (prefs.dietPreference or "non_veg").lower()
+        user_conds_raw = prefs.conditions or []
+        mask = get_candidate_mask(diet_pref, user_conds_raw)
+
+        if mask.sum() == 0:
+            return _empty_response(bmi, tdee, cal_target, prot_target)
+
+        valid_conds = [c for c in (normalize_condition(x) for x in user_conds_raw) if c]
+        if not valid_conds:
+            valid_conds = ["Obesity"]
+
+        # Score per condition (fully vectorized)
+        n_cand = mask.sum()
+        total_probs = np.zeros(n_cand, dtype=np.float64)
+        min_probs = np.ones(n_cand, dtype=np.float64)
+
+        for cond in valid_conds:
+            X = build_X(mask, float(COND_MAP.get(cond, 0)))
+            p = model.predict_proba(X)[:, 1].astype(np.float64)
+            total_probs += p
+            min_probs = np.minimum(min_probs, p)
+
+        scores = 0.6 * (total_probs / len(valid_conds)) + 0.4 * min_probs
+
+        # Add controlled randomness for variety across requests
+        rng = np.random.default_rng()
+        noise = rng.uniform(-0.03, 0.03, size=n_cand)
+        scores = np.clip(scores + noise, 0.0, 1.0)
+
+        # Extract arrays for candidates only
+        c_names = DISH_NAMES[mask]
+        c_cal = CALORIES[mask]
+        c_prot = PROTEIN[mask]
+        c_mt = MEAL_TYPES[mask]
+
+        # Sort by score descending
+        order = np.argsort(-scores)
+        scores = scores[order]
+        c_names = c_names[order]
+        c_cal = c_cal[order]
+        c_prot = c_prot[order]
+        c_mt = c_mt[order]
+
+        # Build recommendations with diversity
+        recs = _diverse_recommendations(c_names, scores, c_cal, c_prot, c_mt)
+
+        # Meal plan
+        meal_plan, meal_totals = _build_meal_plan(
+            c_names, scores, c_cal, c_prot, c_mt, cal_target, prot_target
         )
+        plan_cal = sum(m["calories"] for m in meal_totals.values())
+        plan_prot = sum(m["protein"] for m in meal_totals.values())
 
-        # 5️⃣ Final global cap
-        FINAL_CAP = 35
-        filtered = filtered.sort_values("score", ascending=False).head(FINAL_CAP)
-
-        recommendations = filtered[
-            ["Dish Name", "score", "Calories (kcal)", "Protein (g)", "meal_type"]
-        ].to_dict(orient="records")
-
-        # Keep raw list separate but trimmed
-        rawRecommendations = raw_df.head(80)[
-            ["Dish Name", "score", "Calories (kcal)", "Protein (g)", "meal_type"]
-        ].to_dict(orient="records")
-        
-        # ===== Meal Planning (greedy) =====
-        calorieTarget = float(prefs.calorieTarget) if prefs.calorieTarget else float(tdee)
-        proteinTarget = float(prefs.proteinTarget) if prefs.proteinTarget else float(max(50.0, round(weight * 1.4)))
-
-        splits = {"breakfast": 0.25, "snack": 0.10, "beverage": 0.05, "lunch": 0.30, "dinner": 0.30}
-        mealPlan = {}
-        mealTotals = {}
-
-        df_for_meals = raw_df.copy()
-        df_for_meals["meal_type"] = df_for_meals["meal_type"].fillna("")
-
-        for meal, ratio in splits.items():
-            meal_pool = df_for_meals[df_for_meals["meal_type"].str.contains(meal, na=False)]
-            if meal_pool.empty:
-                meal_pool = df_for_meals  # fallback to entire set
-            items, csum, psum = greedy_select(meal_pool, calorieTarget * ratio, proteinTarget)
-            mealPlan[meal] = items
-            mealTotals[meal] = {"calories": csum, "protein": psum}
-
-        totals = {
-            "plannedCalories": sum(m["calories"] for m in mealTotals.values()),
-            "plannedProtein": sum(m["protein"] for m in mealTotals.values())
-        }
+        elapsed = round(time.time() - t0, 3)
+        print(f"[PREDICT] {len(recs)} recs, {len(valid_conds)} conds, {n_cand} candidates, {elapsed}s")
 
         return {
             "success": True,
-            "healthProfile": {"bmi": bmi, "tdee": tdee, "calorieTarget": calorieTarget, "proteinTarget": proteinTarget},
-            "recommendations": recommendations,
-            "rawRecommendations": rawRecommendations,
-            "mealPlan": mealPlan,
-            "mealTotals": mealTotals,
-            "totals": totals
+            "healthProfile": {"bmi": bmi, "tdee": tdee, "calorieTarget": cal_target, "proteinTarget": prot_target},
+            "recommendations": recs,
+            "rawRecommendations": recs[:50],
+            "mealPlan": meal_plan,
+            "mealTotals": meal_totals,
+            "totals": {"plannedCalories": plan_cal, "plannedProtein": plan_prot},
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        # keep error details in logs, but return generic 500
         import traceback, sys
         traceback.print_exc(file=sys.stdout)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _empty_response(bmi, tdee, cal, prot):
+    return {
+        "success": True,
+        "healthProfile": {"bmi": bmi, "tdee": tdee, "calorieTarget": cal, "proteinTarget": prot},
+        "recommendations": [], "rawRecommendations": [],
+        "mealPlan": {}, "mealTotals": {}, "totals": {},
+    }
+
+
+def _diverse_recommendations(names, scores, cals, prots, meal_types, max_total=24, max_per_cat=2, max_per_meal=6):
+    cat_counts = {}
+    meal_counts = {}
+    recs = []
+    for i in range(len(names)):
+        if len(recs) >= max_total:
+            break
+        if cals[i] < 40 or scores[i] < 0.35:
+            continue
+        cat = auto_category(str(names[i]))
+        mt = str(meal_types[i]).lower()
+        if cat_counts.get(cat, 0) >= max_per_cat:
+            continue
+        if meal_counts.get(mt, 0) >= max_per_meal:
+            continue
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        meal_counts[mt] = meal_counts.get(mt, 0) + 1
+        recs.append({
+            "Dish Name": str(names[i]),
+            "score": round(float(scores[i]), 4),
+            "Calories (kcal)": round(float(cals[i]), 1),
+            "Protein (g)": round(float(prots[i]), 1),
+            "meal_type": mt,
+        })
+    return recs
+
+
+def _build_meal_plan(names, scores, cals, prots, meal_types, cal_target, prot_target):
+    splits = {"breakfast": 0.25, "snack": 0.10, "beverage": 0.05, "lunch": 0.30, "dinner": 0.30}
+    plan = {}
+    totals = {}
+    used = set()
+
+    for meal, ratio in splits.items():
+        budget = cal_target * ratio
+        items = []
+        cal_sum = 0.0
+        prot_sum = 0.0
+        for i in range(len(names)):
+            if len(items) >= 3:
+                break
+            if str(names[i]) in used:
+                continue
+            mt = str(meal_types[i]).lower()
+            if meal not in mt and items:
+                continue
+            c = float(cals[i])
+            if c < 20:
+                continue
+            if cal_sum + c <= budget * 1.1 or not items:
+                items.append({
+                    "Dish Name": str(names[i]),
+                    "score": round(float(scores[i]), 4),
+                    "Calories (kcal)": round(c, 1),
+                    "Protein (g)": round(float(prots[i]), 1),
+                    "meal_type": mt,
+                })
+                used.add(str(names[i]))
+                cal_sum += c
+                prot_sum += float(prots[i])
+
+        plan[meal] = items
+        totals[meal] = {"calories": round(cal_sum, 1), "protein": round(prot_sum, 1)}
+
+    return plan, totals
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    _port = int(os.environ.get("PORT", "8001"))
+    uvicorn.run(app, host="0.0.0.0", port=_port)
