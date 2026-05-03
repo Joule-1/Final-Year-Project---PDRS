@@ -5,6 +5,10 @@ import { errorHandler } from "./middlewares/errorHandler.middlewares.js";
 
 const app = express();
 
+app.get("/", (req, res) => {
+    res.status(200).json({ status: "ok" });
+});
+
 app.use(
     cors({
         origin: function (origin, callback) {
@@ -16,7 +20,7 @@ app.use(
             }
         },
         credentials: true,
-    })
+    })[]
 );
 
 app.use(express.static("public"));
