@@ -53,6 +53,10 @@ if not os.path.isfile(DATA_PATH):
 
 app = FastAPI(title="DietRecommendationEngine-Pro")
 
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
 print("[INIT] Loading model...")
 model = load_classifier()
 print("[INIT] Loading CSV...")
