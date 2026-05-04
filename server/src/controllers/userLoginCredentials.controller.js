@@ -5,10 +5,11 @@ import { UserLogin } from "../models/userLoginCredentials.model.js";
 import validator from "validator";
 import jwt from "jsonwebtoken";
 
+/** Cross-origin SPA (e.g. Vercel) + API (e.g. Render): Lax cookies are not sent on XHR to another site; None+Secure is required. */
 const cookieOptions = {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
 };
 
 const generateAccessAndRefreshTokens = async (userId) => {
